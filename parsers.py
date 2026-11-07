@@ -55,6 +55,7 @@ class SiteResult:
     elapsed: float = 0.0
     offers: List[Offer] = field(default_factory=list)
     raw_html: str = ""       # только в debug-режиме
+    suggestions: List[Tuple[str, int, str]] = field(default_factory=list)  # (селектор, кол-во, пример)
 
 
 @dataclass
@@ -173,7 +174,7 @@ UA_LIST = [
 ]
 
 PRICE_RE = re.compile(
-    r"(\d[\d\s\u00a0\u202f]{0,9}(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|р\.|rub)",
+    r"((?:\d{1,3}(?:[\s\u00a0\u202f]\d{3})+|\d+)(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|р\.|rub)",
     re.IGNORECASE,
 )
 BLOCK_MARKERS = ("captcha", "recaptcha", "access denied", "cloudflare", "are you a robot",
@@ -389,6 +390,88 @@ def strategy_html_cards(soup: BeautifulSoup, cfg: SiteConfig, url: str) -> List[
     return []
 
 
+
+# ---------------------------------------------------------------------------
+# Автоопределение карточек: ищем повторяющиеся блоки, в которых есть цена
+# ---------------------------------------------------------------------------
+
+_BAD_CLASS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _selector_for(el) -> str:
+    classes = [c for c in (el.get("class") or []) if c and not _BAD_CLASS.search(c) and not c[0].isdigit()]
+    sel = el.name + "".join(f".{c}" for c in classes[:3])
+    if not classes and el.parent is not None and el.parent.name not in ("[document]", "html", "body"):
+        pc = [c for c in (el.parent.get("class") or []) if c and not _BAD_CLASS.search(c) and not c[0].isdigit()]
+        if pc:
+            sel = f"{el.parent.name}.{pc[0]} > {el.name}"
+    return sel
+
+
+def find_repeating_cards(soup: BeautifulSoup, min_repeat: int = 3, limit: int = 5):
+    """Возвращает [(selector, count, sample_text, elements)] — лучшие кандидаты в карточки."""
+    groups: Dict[tuple, list] = {}
+    for el in soup.find_all(True):
+        if el.name in ("script", "style", "html", "body", "head", "svg", "path"):
+            continue
+        text = el.get_text(" ", strip=True)
+        if not text or len(text) > 500 or not text_prices(text):
+            continue
+        sig = (el.name, tuple(sorted(el.get("class") or [])),
+               el.parent.name if el.parent else "")
+        groups.setdefault(sig, []).append(el)
+
+    groups = {k: v for k, v in groups.items() if len(v) >= min_repeat}
+    # убираем «вложенные» группы (td внутри tr) — оставляем внешний уровень
+    all_ids = {k: {id(e) for e in v} for k, v in groups.items()}
+    outer = {}
+    for k, els in groups.items():
+        nested = 0
+        for e in els:
+            for anc in e.parents:
+                if any(id(anc) in ids for k2, ids in all_ids.items() if k2 != k):
+                    nested += 1
+                    break
+        if nested < len(els) / 2:
+            outer[k] = els
+
+    ranked = sorted(outer.values(), key=lambda els: (-len(els), -len(els[0].get_text())))
+    out = []
+    for els in ranked[:limit]:
+        out.append((_selector_for(els[0]), len(els), els[0].get_text(" ", strip=True)[:90], els))
+    return out
+
+
+def _guess_brand(text: str) -> str:
+    low = text.lower()
+    for b in sorted(OEM_BRANDS, key=len, reverse=True):
+        if re.search(rf"(?<![a-zа-я0-9]){re.escape(b)}(?![a-zа-я0-9])", low):
+            return b.title()
+    return ""
+
+
+def strategy_auto_cards(soup: BeautifulSoup, cfg: SiteConfig, url: str) -> List[Offer]:
+    cands = find_repeating_cards(soup)
+    if not cands:
+        return []
+    sel, _, _, els = cands[0]
+    offers = []
+    for card in els[:200]:
+        text = card.get_text(" ", strip=True)
+        prices = text_prices(text)
+        if not prices:
+            continue
+        a = card.select_one("a[href]")
+        offers.append(Offer(
+            cfg.title,
+            _first_text(card, cfg.brand_selectors)[:40] or _guess_brand(text),
+            _first_text(card, cfg.name_selectors)[:90] or text[:90],
+            min(prices),
+            urljoin(url, a["href"]) if a else url,
+            via=f"auto:{sel}",
+        ))
+    return offers
+
 def strategy_text(soup: BeautifulSoup, cfg: SiteConfig, url: str) -> List[Offer]:
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
@@ -400,6 +483,7 @@ STRATEGIES = [
     ("json_ld", strategy_json_ld),
     ("embedded", strategy_embedded),
     ("html_cards", strategy_html_cards),
+    ("auto_cards", strategy_auto_cards),
     ("text", strategy_text),
 ]
 
@@ -460,6 +544,9 @@ def run_site(cfg: SiteConfig, article: str, car_brand: str = "",
         return res
 
     offers, strategy = extract(html, cfg, url)
+    if not offers or debug or strategy in ("auto_cards", "text"):
+        res.suggestions = [(s, n, t) for s, n, t, _ in
+                           find_repeating_cards(BeautifulSoup(html, "html.parser"))]
     if not offers:
         if any(m.lower() in low for m in JS_MARKERS):
             res.status = "js_required"

@@ -128,6 +128,10 @@ if st.session_state.site_results:
         } for r in st.session_state.site_results]
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
         for r in st.session_state.site_results:
+            if r.suggestions and r.status != "ok" or (r.suggestions and debug):
+                st.markdown(f"**{r.site}** — кандидаты в `card_selectors`:")
+                st.dataframe(pd.DataFrame(r.suggestions, columns=["Селектор", "Блоков", "Пример"]),
+                             hide_index=True, use_container_width=True)
             if r.raw_html:
                 st.download_button(f"⬇ HTML: {r.site}", r.raw_html,
                                    file_name=f"debug_{r.site}.html", key=f"dl_{r.site}")
