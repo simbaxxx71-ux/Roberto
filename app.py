@@ -2,283 +2,156 @@
 Поиск ТОЛЬКО ОРИГИНАЛЬНЫХ (OEM) автозапчастей по каталожному номеру
 и расчёт средней рыночной цены.
 
-Запуск через браузер:
-    streamlit run app.py
+Запуск:  streamlit run app.py
 """
 
-import streamlit as st
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 import re
+from dataclasses import asdict
 from urllib.parse import quote_plus
-from typing import List, Dict
-import time
 
-st.set_page_config(
-    page_title="Оригинальные запчасти — поиск по артикулу",
-    page_icon="🔧",
-    layout="wide",
-)
+import pandas as pd
+import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Сайты с акцентом на оригинальные (OEM) запчасти
-# ---------------------------------------------------------------------------
+import parsers
+from parsers import SITES, drop_outliers, playwright_available, search_all
 
-SITES = {
-    "Exist.ru (оригинал)": {
-        "search_url": "https://exist.ru/Price/?pcode={article}",
-        "note": "Агрегатор. Смотрите предложения с пометкой «Оригинал» / OEM.",
-    },
-    "Emex.ru": {
-        "search_url": "https://emex.ru/products?detailNum={article}",
-        "note": "Крупный поставщик. Фильтруйте по бренду производителя авто.",
-    },
-    "Autodoc.ru": {
-        "search_url": "https://www.autodoc.ru/search?q={article}+оригинал",
-        "note": "Поиск с фильтром «оригинал».",
-    },
-    "ZZap.ru": {
-        "search_url": "https://www.zzap.ru/public/search.aspx?searchtext={article}",
-        "note": "Маркетплейс. Выбирайте продавцов с оригиналом.",
-    },
-    "Part-Kom.ru": {
-        "search_url": "https://www.part-kom.ru/search/?q={article}",
-        "note": "Хороший поиск по OEM-номерам.",
-    },
-    "Google — только оригинал": {
-        "search_url": "https://www.google.com/search?q=%22{article}%22+оригинал+OEM+запчасть+цена+-аналог+-aftermarket",
-        "note": "Поиск строго по оригиналу (исключает аналоги).",
-    },
-}
+st.set_page_config(page_title="Оригинальные запчасти — поиск по артикулу",
+                   page_icon="🔧", layout="wide")
+
+STATUS_ICON = {"ok": "✅", "empty": "⚪", "blocked": "⛔", "js_required": "🧩",
+               "timeout": "⏱️", "error": "❌"}
+ORIGIN_LABEL = {"original": "оригинал", "unknown": "не определено",
+                "other": "др. бренд", "analog": "аналог"}
 
 
 def clean_article(article: str) -> str:
-    """Очистка артикула: только буквы и цифры."""
     return re.sub(r"[^A-Za-z0-9]", "", article).upper()
 
 
-def try_parse_exist_prices(article: str) -> List[Dict]:
-    """Best-effort парсинг Exist.ru (часто блокируется)."""
-    results = []
-    try:
-        url = f"https://exist.ru/Price/?pcode={quote_plus(article)}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "ru-RU,ru;q=0.9",
-        }
-        resp = requests.get(url, headers=headers, timeout=12)
-        if resp.status_code != 200:
-            return results
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        price_matches = re.findall(
-            r"(\d[\d\s]{0,10}(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|RUB)",
-            text,
-            flags=re.IGNORECASE,
-        )
-        for p in price_matches[:12]:
-            try:
-                val = float(p.replace(" ", "").replace(",", "."))
-                if 80 < val < 400000:
-                    results.append({
-                        "source": "Exist.ru",
-                        "brand": "OEM / Оригинал",
-                        "name": article,
-                        "price": val,
-                        "currency": "RUB",
-                        "link": url,
-                        "is_original": True,
-                    })
-            except ValueError:
-                continue
-
-        seen = set()
-        unique = []
-        for r in results:
-            if r["price"] not in seen:
-                seen.add(r["price"])
-                unique.append(r)
-        return unique[:8]
-    except Exception:
-        return []
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_search(article, car_brand, site_keys, use_js, debug):
+    return search_all(article, car_brand, list(site_keys), use_js, debug)
 
 
-def search_web_prices(article: str) -> List[Dict]:
-    """Поиск цен только по оригинальным запчастям через DuckDuckGo."""
-    results = []
-    try:
-        # Жёсткий акцент на оригинал / OEM
-        query = f'"{article}" оригинал OEM запчасть цена -аналог -aftermarket -заменитель'
-        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        resp = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        for result in soup.select(".result")[:10]:
-            title_el = result.select_one(".result__a")
-            snippet_el = result.select_one(".result__snippet")
-            link = title_el.get("href") if title_el else ""
-            title = title_el.get_text(strip=True) if title_el else ""
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            text = f"{title} {snippet}".lower()
-
-            # Отбрасываем явные аналоги
-            if any(x in text for x in ["аналог", "aftermarket", "заменитель", "неоригинал"]):
-                continue
-
-            prices = re.findall(
-                r"(\d[\d\s]{0,8}(?:[.,]\d{1,2})?)\s*(?:₽|руб\.?|rub)",
-                text,
-                flags=re.IGNORECASE,
-            )
-            for p in prices:
-                try:
-                    val = float(p.replace(" ", "").replace(",", "."))
-                    if 100 < val < 350000:
-                        results.append({
-                            "source": "Веб-поиск (OEM)",
-                            "brand": "Оригинал",
-                            "name": title[:70] if title else article,
-                            "price": val,
-                            "currency": "RUB",
-                            "link": link or "",
-                            "is_original": True,
-                        })
-                except ValueError:
-                    continue
-
-        seen = set()
-        unique = []
-        for r in results:
-            if r["price"] not in seen:
-                seen.add(r["price"])
-                unique.append(r)
-        return unique[:6]
-    except Exception:
-        return []
-
-
-def calculate_stats(prices: List[float]) -> Dict:
+def calculate_stats(prices):
     if not prices:
         return {}
     s = pd.Series(prices)
-    return {
-        "count": len(prices),
-        "min": float(s.min()),
-        "max": float(s.max()),
-        "mean": float(s.mean()),
-        "median": float(s.median()),
-    }
+    return {"count": len(prices), "min": float(s.min()), "max": float(s.max()),
+            "mean": float(s.mean()), "median": float(s.median())}
 
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    st.header("Парсинг")
+    chosen = st.multiselect("Сайты", [c.key for c in SITES],
+                            default=[c.key for c in SITES],
+                            format_func=lambda k: next(c.title for c in SITES if c.key == k))
+    car_brand = st.text_input("Бренд авто (для фильтра оригинала)",
+                              placeholder="Toyota, Volkswagen, BMW…",
+                              help="Если указан — оригиналом считается только этот бренд.")
+    include_unknown = st.checkbox("Включать предложения без бренда", value=False)
+    drop_out = st.checkbox("Отсекать выбросы цен", value=True)
+
+    pw = playwright_available()
+    use_js = st.checkbox("Режим браузера (Playwright) для JS-сайтов", value=False, disabled=not pw,
+                         help="Медленнее, но берёт сайты, где цены подгружаются скриптом.")
+    if not pw:
+        st.caption("Playwright не установлен: `pip install playwright && playwright install chromium`")
+    debug = st.checkbox("Отладка (сохранять HTML)", value=False)
+    if st.button("Сбросить кэш поиска"):
+        st.cache_data.clear()
+
+    st.info("Сайты могут блокировать парсинг. Для стабильной работы лучше API "
+            "(ABCP / UMAPI / PartsAPI / API самих поставщиков) и ручной ввод цен.")
 
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
 st.title("🔧 Только оригинальные (OEM) запчасти")
-st.markdown(
-    """
-Введите **каталожный номер** оригинальной запчасти.  
-Приложение ищет **только оригиналы** (OEM), показывает ссылки на сайты  
-и считает **среднюю рыночную цену** по найденным предложениям.
-"""
-)
+st.markdown("Введите **каталожный номер** — приложение опросит выбранные сайты, "
+            "оставит оригинальные предложения и посчитает среднюю цену.")
 
-with st.sidebar:
-    st.header("Режим")
-    st.success("Только оригиналы (OEM)")
-    st.info(
-        "Автоматический парсинг часто блокируется сайтами.\n\n"
-        "Для точных данных используйте API:\n"
-        "• FAPI (fapi.iisis.ru) — бесплатный пробный пакет\n"
-        "• UMAPI / PartsAPI / ABCP\n\n"
-        "Добавляйте найденные цены вручную — так точнее."
-    )
-    use_auto_search = st.checkbox("Автоматический поиск цен", value=True)
-    st.markdown("---")
-    st.caption("Запуск: streamlit run app.py → откроется в браузере")
-
-article_input = st.text_input(
-    "Каталожный номер (OEM)",
-    placeholder="Например: 04465-02280  |  1J0698151B  |  W75/3",
-    help="Пробелы и дефисы будут убраны автоматически.",
-)
-
+article_input = st.text_input("Каталожный номер (OEM)",
+                              placeholder="04465-02280  |  1J0698151B  |  W75/3",
+                              help="Пробелы и дефисы убираются автоматически.")
 search_btn = st.button("🔍 Найти оригиналы", type="primary", use_container_width=True)
 
-if "offers" not in st.session_state:
-    st.session_state.offers = []
+st.session_state.setdefault("offers", [])
+st.session_state.setdefault("site_results", [])
 
 if search_btn and article_input.strip():
     article = clean_article(article_input)
     st.session_state.current_article = article
     st.session_state.offers = []
 
-    st.subheader(f"Оригинальные предложения для: `{article}`")
+    with st.spinner(f"Опрашиваем {len(chosen)} сайт(ов)…"):
+        results = cached_search(article, car_brand.strip(), tuple(chosen), use_js, debug)
+    st.session_state.site_results = results
 
-    # Ссылки
-    st.markdown("### 🔗 Поиск на сайтах (только оригинал)")
-    cols = st.columns(3)
-    for i, (name, info) in enumerate(SITES.items()):
-        url = info["search_url"].format(article=quote_plus(article))
-        with cols[i % 3]:
-            st.link_button(name, url, use_container_width=True)
-            st.caption(info["note"])
+    allowed = {"original"} | ({"unknown"} if include_unknown else set())
+    for r in results:
+        for o in r.offers:
+            if o.origin in allowed:
+                d = asdict(o)
+                d["origin"] = ORIGIN_LABEL[o.origin]
+                st.session_state.offers.append(d)
 
-    # Автопоиск
-    if use_auto_search:
-        with st.spinner("Ищем оригинальные предложения..."):
-            auto = []
-            auto.extend(try_parse_exist_prices(article))
-            time.sleep(0.4)
-            auto.extend(search_web_prices(article))
+    if not st.session_state.offers:
+        st.warning("Оригинальных предложений не найдено — смотрите диагностику ниже "
+                   "или добавьте цены вручную.")
 
-        if auto:
-            st.success(f"Автоматически найдено: {len(auto)} предложений")
-            st.session_state.offers.extend(auto)
-        else:
-            st.warning(
-                "Автопоиск не вернул надёжных цен (защита сайтов). "
-                "Откройте ссылки выше и добавьте цены вручную."
-            )
+# Ссылки на сайты (всегда полезны, если парсер не сработал)
+if st.session_state.get("current_article"):
+    art = st.session_state.current_article
+    st.subheader(f"Артикул: `{art}`")
+    cols = st.columns(min(len(SITES), 5))
+    for i, c in enumerate(SITES):
+        with cols[i % len(cols)]:
+            st.link_button(c.title, c.url.format(article=quote_plus(art)), use_container_width=True)
+
+# Диагностика по сайтам
+if st.session_state.site_results:
+    with st.expander("🩺 Диагностика парсинга по сайтам", expanded=not st.session_state.offers):
+        rows = [{
+            "Сайт": r.site,
+            "Статус": f"{STATUS_ICON.get(r.status, '?')} {r.status}",
+            "Стратегия": r.strategy or "—",
+            "Найдено": len(r.offers),
+            "Оригиналов": sum(o.origin == "original" for o in r.offers),
+            "Время, с": round(r.elapsed, 1),
+            "Комментарий": r.message,
+        } for r in st.session_state.site_results]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        for r in st.session_state.site_results:
+            if r.raw_html:
+                st.download_button(f"⬇ HTML: {r.site}", r.raw_html,
+                                   file_name=f"debug_{r.site}.html", key=f"dl_{r.site}")
 
 # ---------------------------------------------------------------------------
-# Ручное добавление (только оригинал)
+# Ручное добавление
 # ---------------------------------------------------------------------------
 
 st.markdown("---")
 st.subheader("➕ Добавить оригинальное предложение")
-
 with st.form("add_offer", clear_on_submit=True):
     c1, c2, c3, c4 = st.columns([2.2, 2, 1.5, 1])
-    with c1:
-        source = st.text_input("Магазин / источник", placeholder="Exist, Emex, дилер...")
-    with c2:
-        brand = st.text_input("Бренд (OEM)", placeholder="Toyota, VW, Bosch OEM...")
-    with c3:
-        price = st.number_input("Цена, ₽", min_value=0.0, step=50.0, format="%.0f")
+    source = c1.text_input("Магазин / источник", placeholder="Exist, Emex, дилер…")
+    brand = c2.text_input("Бренд (OEM)", placeholder="Toyota, VW…")
+    price = c3.number_input("Цена, ₽", min_value=0.0, step=50.0, format="%.0f")
     with c4:
         st.write("")
         st.write("")
         submitted = st.form_submit_button("Добавить", use_container_width=True)
-
     if submitted and price > 0:
         st.session_state.offers.append({
-            "source": source or "Ручной ввод",
-            "brand": brand or "Оригинал",
+            "source": source or "Ручной ввод", "brand": brand or "Оригинал",
             "name": st.session_state.get("current_article", "—"),
-            "price": float(price),
-            "currency": "RUB",
-            "link": "",
-            "is_original": True,
+            "price": float(price), "link": "", "origin": "оригинал", "via": "manual",
         })
         st.success("Добавлено")
 
@@ -291,25 +164,25 @@ if st.session_state.offers:
     st.subheader("📋 Оригинальные предложения")
 
     df = pd.DataFrame(st.session_state.offers)
-    display = df[["source", "brand", "name", "price"]].copy()
-    display.columns = ["Источник", "Бренд", "Артикул / название", "Цена, ₽"]
-    display = display.sort_values("Цена, ₽")
-    st.dataframe(display, use_container_width=True, hide_index=True)
+    show = df[["source", "brand", "name", "price", "origin", "link"]].copy()
+    show.columns = ["Источник", "Бренд", "Название", "Цена, ₽", "Тип", "Ссылка"]
+    st.dataframe(show.sort_values("Цена, ₽"), use_container_width=True, hide_index=True,
+                 column_config={"Ссылка": st.column_config.LinkColumn("Ссылка", display_text="открыть")})
 
     prices = [o["price"] for o in st.session_state.offers]
-    stats = calculate_stats(prices)
+    used = drop_outliers(prices) if drop_out else prices
+    if len(used) != len(prices):
+        st.caption(f"Отсечено выбросов: {len(prices) - len(used)}")
+    stats = calculate_stats(used)
 
     st.markdown("### 📊 Средняя рыночная цена (только оригиналы)")
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Предложений", stats["count"])
     m2.metric("Минимум", f"{stats['min']:,.0f} ₽")
     m3.metric("Максимум", f"{stats['max']:,.0f} ₽")
-    m4.metric("Средняя цена", f"{stats['mean']:,.0f} ₽")
-
-    st.metric("Медиана", f"{stats['median']:,.0f} ₽")
-
-    chart_df = pd.DataFrame({"Цена, ₽": prices})
-    st.bar_chart(chart_df, height=220)
+    m4.metric("Средняя", f"{stats['mean']:,.0f} ₽")
+    m5.metric("Медиана", f"{stats['median']:,.0f} ₽")
+    st.bar_chart(pd.DataFrame({"Цена, ₽": sorted(used)}), height=220)
 
     if st.button("Очистить список"):
         st.session_state.offers = []
@@ -318,8 +191,5 @@ else:
     st.info("Введите OEM-номер и нажмите «Найти оригиналы» или добавьте цену вручную.")
 
 st.markdown("---")
-st.caption(
-    "Только оригинальные запчасти (OEM). "
-    "Автоматический сбор цен приблизительный. "
-    "Для продакшена подключайте API каталогов и проценки поставщиков."
-)
+st.caption("Автоматический сбор цен приблизительный и зависит от верстки сайтов. "
+           "Соблюдайте условия использования сайтов и не делайте частых запросов.")
