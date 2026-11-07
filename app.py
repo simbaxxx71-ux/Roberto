@@ -13,7 +13,8 @@ import pandas as pd
 import streamlit as st
 
 import parsers
-from parsers import SITES, drop_outliers, playwright_available, search_all
+from parsers import (SITES, drop_outliers, make_custom_sites, parse_blob,
+                     playwright_available, search_all)
 
 st.set_page_config(page_title="Оригинальные запчасти — поиск по артикулу",
                    page_icon="🔧", layout="wide")
@@ -29,8 +30,23 @@ def clean_article(article: str) -> str:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_search(article, car_brand, site_keys, use_js, debug):
-    return search_all(article, car_brand, list(site_keys), use_js, debug)
+def cached_search(article, car_brand, site_keys, use_js, debug, custom_text):
+    return search_all(article, car_brand, list(site_keys), use_js, debug,
+                      extra_sites=make_custom_sites(custom_text))
+
+
+def add_offers(results):
+    """Кладёт в таблицу предложения нужного типа; возвращает сколько добавлено."""
+    allowed = {"original"} | ({"unknown"} if include_unknown else set())
+    n = 0
+    for r in results:
+        for o in r.offers:
+            if o.origin in allowed:
+                d = asdict(o)
+                d["origin"] = ORIGIN_LABEL[o.origin]
+                st.session_state.offers.append(d)
+                n += 1
+    return n
 
 
 def calculate_stats(prices):
@@ -47,9 +63,16 @@ def calculate_stats(prices):
 
 with st.sidebar:
     st.header("Парсинг")
-    chosen = st.multiselect("Сайты", [c.key for c in SITES],
-                            default=[c.key for c in SITES],
-                            format_func=lambda k: next(c.title for c in SITES if c.key == k))
+    parsable = [c for c in SITES if not c.link_only]
+    chosen = st.multiselect("Сайты для парсинга", [c.key for c in parsable],
+                            default=[c.key for c in parsable if c.verified],
+                            format_func=lambda k: next(c.title + ("" if c.verified else " ⚠")
+                                                       for c in parsable if c.key == k),
+                            help="⚠ — адрес поиска не проверен, смотрите HTTP-код в диагностике.")
+    custom_text = st.text_area("Свои сайты (по одному в строке)", height=90,
+                               placeholder="Мой магазин | https://site.ru/search?q={article}",
+                               help="Формат: Название | URL, где вместо артикула стоит {article}. "
+                                    "Селекторы не нужны — карточки ищутся автоматически.")
     car_brand = st.text_input("Бренд авто (для фильтра оригинала)",
                               placeholder="Toyota, Volkswagen, BMW…",
                               help="Если указан — оригиналом считается только этот бренд.")
@@ -90,16 +113,9 @@ if search_btn and article_input.strip():
     st.session_state.offers = []
 
     with st.spinner(f"Опрашиваем {len(chosen)} сайт(ов)…"):
-        results = cached_search(article, car_brand.strip(), tuple(chosen), use_js, debug)
-    st.session_state.site_results = results
-
-    allowed = {"original"} | ({"unknown"} if include_unknown else set())
-    for r in results:
-        for o in r.offers:
-            if o.origin in allowed:
-                d = asdict(o)
-                d["origin"] = ORIGIN_LABEL[o.origin]
-                st.session_state.offers.append(d)
+        results = cached_search(article, car_brand.strip(), tuple(chosen), use_js, debug, custom_text)
+    st.session_state.site_results = list(results)
+    add_offers(results)
 
     if not st.session_state.offers:
         st.warning("Оригинальных предложений не найдено — смотрите диагностику ниже "
@@ -109,12 +125,18 @@ if search_btn and article_input.strip():
 if st.session_state.get("current_article"):
     art = st.session_state.current_article
     st.subheader(f"Артикул: `{art}`")
-    cols = st.columns(min(len(SITES), 5))
-    for i, c in enumerate(SITES):
-        with cols[i % len(cols)]:
+    st.caption("Если сайт просит капчу — откройте его здесь, пройдите проверку сами и загрузите страницу ниже.")
+    cols = st.columns(4)
+    for i, c in enumerate(SITES + make_custom_sites(custom_text)):
+        with cols[i % 4]:
             st.link_button(c.title, c.url.format(article=quote_plus(art)), use_container_width=True)
 
 # Диагностика по сайтам
+_blocked = [r.site for r in st.session_state.site_results if r.status == "blocked"]
+if _blocked:
+    st.error(f"Капча/блокировка: {', '.join(_blocked)}. Автоматически это не обойти (и не нужно): "
+             "откройте сайт кнопкой выше, пройдите проверку, затем загрузите страницу в блоке "
+             "«Загрузить страницу» ниже. Из облака Streamlit блокировок будет больше, чем с домашнего IP.")
 if st.session_state.site_results:
     with st.expander("🩺 Диагностика парсинга по сайтам", expanded=not st.session_state.offers):
         rows = [{
@@ -139,6 +161,28 @@ if st.session_state.site_results:
 # ---------------------------------------------------------------------------
 # Ручное добавление
 # ---------------------------------------------------------------------------
+
+st.markdown("---")
+st.subheader("📥 Загрузить страницу, открытую в браузере")
+st.caption("Откройте выдачу сайта, пройдите капчу, затем сохраните страницу (Ctrl+S → «Веб-страница, только HTML») "
+           "или выделите всё (Ctrl+A, Ctrl+C) и вставьте текст сюда.")
+up_files = st.file_uploader("HTML-файлы", type=["html", "htm", "txt"], accept_multiple_files=True)
+pasted = st.text_area("…или вставьте HTML / скопированный текст страницы", height=120)
+if st.button("Разобрать загруженное"):
+    blobs = [(f.name, f.getvalue().decode("utf-8", errors="ignore")) for f in up_files]
+    if pasted.strip():
+        blobs.append(("Вставленная страница", pasted))
+    if not blobs:
+        st.warning("Загрузите файл или вставьте содержимое.")
+    parsed = [parse_blob(txt, name, car_brand.strip()) for name, txt in blobs]
+    n = add_offers(parsed)
+    st.session_state.site_results = list(st.session_state.site_results) + parsed
+    for r in parsed:
+        st.write(f"{STATUS_ICON.get(r.status, '?')} **{r.site}** — {r.message}")
+    if n:
+        st.success(f"Добавлено в таблицу: {n}")
+    elif parsed:
+        st.info("Оригиналов не добавлено. Укажите бренд авто слева или включите «Включать предложения без бренда».")
 
 st.markdown("---")
 st.subheader("➕ Добавить оригинальное предложение")

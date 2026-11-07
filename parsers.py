@@ -22,7 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -69,6 +69,8 @@ class SiteConfig:
     needs_js: bool = False                     # сайт рисует выдачу через JS
     encoding: Optional[str] = None             # принудительная кодировка (cp1251 и т.п.)
     note: str = ""
+    verified: bool = True                      # False = шаблон адреса не проверен вживую
+    link_only: bool = False                    # только кнопка-ссылка, без парсинга (сильная защита)
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +127,48 @@ SITES: List[SiteConfig] = [
         needs_js=True,
     ),
 ]
+
+# Дополнительные сайты. verified=False: шаблон адреса я не смог проверить вживую —
+# если в диагностике HTTP 404, поправьте url (откройте сайт, введите артикул, скопируйте адрес
+# из браузера и замените артикул на {article}).
+SITES += [
+    SiteConfig(key="autopiter", title="Autopiter.ru", url="https://autopiter.ru/goods/{article}",
+               card_selectors=GENERIC_CARDS, needs_js=True, verified=False),
+    SiteConfig(key="armtek", title="Armtek.ru", url="https://armtek.ru/search?text={article}",
+               card_selectors=GENERIC_CARDS, needs_js=True, verified=False),
+    SiteConfig(key="rossko", title="Rossko.ru", url="https://rossko.ru/search?text={article}",
+               card_selectors=GENERIC_CARDS, needs_js=True, verified=False),
+    SiteConfig(key="trast", title="Trast-Zap.ru", url="https://www.trast-zap.ru/search/?search={article}",
+               card_selectors=GENERIC_CARDS, verified=False),
+    SiteConfig(key="autoeuro", title="Autoeuro.ru", url="https://autoeuro.ru/search/?search={article}",
+               card_selectors=GENERIC_CARDS, needs_js=True, verified=False),
+    SiteConfig(key="euroauto", title="Euroauto.ru", url="https://euroauto.ru/search/?q={article}",
+               card_selectors=GENERIC_CARDS, verified=False),
+    # Только ссылки: у них сильная антибот-защита, парсинг почти всегда упирается в капчу
+    SiteConfig(key="ozon", title="Ozon", url="https://www.ozon.ru/search/?text={article}", link_only=True),
+    SiteConfig(key="wb", title="Wildberries", url="https://www.wildberries.ru/catalog/0/search.aspx?search={article}", link_only=True),
+    SiteConfig(key="ymarket", title="Яндекс Маркет", url="https://market.yandex.ru/search?text={article}", link_only=True),
+    SiteConfig(key="avito", title="Avito", url="https://www.avito.ru/rossiya?q={article}", link_only=True),
+    SiteConfig(key="yandex", title="Яндекс (оригинал)", url="https://yandex.ru/search/?text=%22{article}%22+оригинал+купить", link_only=True),
+]
+
+
+def make_custom_sites(text: str) -> List[SiteConfig]:
+    """Строки вида  'Название | https://site.ru/search?q={article}'  или просто URL."""
+    out = []
+    for i, line in enumerate((text or "").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        title, _, url = line.partition("|") if "|" in line else ("", "", line)
+        url = url.strip()
+        if not url.startswith(("http://", "https://")) or "{article}" not in url:
+            continue
+        title = title.strip() or urlparse(url).netloc
+        out.append(SiteConfig(key=f"custom{i}", title=title, url=url,
+                              card_selectors=GENERIC_CARDS, needs_js=True, verified=False))
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Определение «оригинал / не оригинал»
@@ -229,15 +273,28 @@ def _str(v) -> str:
 # Загрузка страниц
 # ---------------------------------------------------------------------------
 
-def fetch_plain(url: str, encoding: Optional[str], timeout: int = 15, retries: int = 2) -> Tuple[int, str]:
+def fetch_plain(url: str, encoding: Optional[str], timeout: int = 15, retries: int = 2,
+                warmup: bool = True) -> Tuple[int, str]:
+    """Одна сессия на сайт: прогрев главной (cookies), единый User-Agent, Referer, повторы.
+    Это снижает долю капч, но не гарантирует обход защиты — особенно с облачных IP."""
     sess = requests.Session()
+    ua = random.choice(UA_LIST)
+    u = urlparse(url)
+    origin = f"{u.scheme}://{u.netloc}/"
+    base = {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
+    }
+    if warmup:
+        try:
+            sess.get(origin, headers=base, timeout=8)
+            time.sleep(random.uniform(0.4, 1.0))
+        except requests.RequestException:
+            pass
+    headers = {**base, "Referer": origin}
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
-        headers = {
-            "User-Agent": random.choice(UA_LIST),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.6",
-        }
         try:
             r = sess.get(url, headers=headers, timeout=timeout, allow_redirects=True)
             if r.status_code in (429, 503) and attempt < retries:
@@ -540,7 +597,9 @@ def run_site(cfg: SiteConfig, article: str, car_brand: str = "",
         res.status, res.message = "blocked", f"HTTP {code}: сайт блокирует/просит капчу"
         return res
     if code >= 400:
-        res.status, res.message = "error", f"HTTP {code}"
+        res.status = "error"
+        res.message = f"HTTP {code}" + (": неверный URL-шаблон — откройте сайт вручную и поправьте url в SiteConfig"
+                                        if code == 404 else "")
         return res
 
     offers, strategy = extract(html, cfg, url)
@@ -566,8 +625,10 @@ def run_site(cfg: SiteConfig, article: str, car_brand: str = "",
 
 
 def search_all(article: str, car_brand: str = "", site_keys: Optional[List[str]] = None,
-               use_js: bool = False, debug: bool = False, workers: int = 5) -> List[SiteResult]:
-    cfgs = [c for c in SITES if not site_keys or c.key in site_keys]
+               use_js: bool = False, debug: bool = False, workers: int = 5,
+               extra_sites: Optional[List[SiteConfig]] = None) -> List[SiteResult]:
+    cfgs = [c for c in SITES if not c.link_only and (not site_keys or c.key in site_keys)]
+    cfgs += list(extra_sites or [])
     results: List[SiteResult] = []
     # Playwright-запуски тяжёлые — ограничиваем параллелизм
     max_workers = 2 if use_js else workers
@@ -581,6 +642,45 @@ def search_all(article: str, car_brand: str = "", site_keys: Optional[List[str]]
                 results.append(SiteResult(c.title, c.url, "error", message=str(e)[:200]))
     order = {c.title: i for i, c in enumerate(cfgs)}
     return sorted(results, key=lambda r: order.get(r.site, 99))
+
+
+
+# ---------------------------------------------------------------------------
+# Разбор страницы, которую пользователь сам открыл/сохранил в браузере
+# (так можно обойти капчу легально: вы проходите её сами)
+# ---------------------------------------------------------------------------
+
+def strategy_lines(text: str, cfg: SiteConfig) -> List[Offer]:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    offers = []
+    for i, line in enumerate(lines):
+        prices = text_prices(line)
+        if not prices:
+            continue
+        name = line if len(line) > 25 or i == 0 else f"{lines[i - 1]} {line}"
+        offers.append(Offer(cfg.title, _guess_brand(name), name[:90], min(prices), "", via="lines"))
+    return offers
+
+
+def parse_blob(content: str, source: str, car_brand: str = "") -> SiteResult:
+    cfg = SiteConfig(key="upload", title=source, url="", card_selectors=GENERIC_CARDS, verified=False)
+    res = SiteResult(site=source, url="")
+    is_html = bool(re.search(r"<(html|div|table|tr|body|script|span|a)\b", content, re.I))
+    if is_html:
+        offers, strat = extract(content, cfg, "")
+        if not offers:
+            res.suggestions = [(s, n, t) for s, n, t, _ in
+                               find_repeating_cards(BeautifulSoup(content, "html.parser"))]
+    else:
+        offers, strat = strategy_lines(content, cfg), "lines"
+    if not offers:
+        res.status, res.message = "empty", "Цены в содержимом не найдены (формат: «1 234 ₽» / «1234 руб»)"
+        return res
+    for o in offers:
+        o.origin = classify_origin(o.brand, o.name, car_brand)
+    res.offers, res.strategy, res.status = dedupe(offers), strat, "ok"
+    res.message = f"{len(res.offers)} предложений"
+    return res
 
 
 # ---------------------------------------------------------------------------
